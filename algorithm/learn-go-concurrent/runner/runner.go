@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/signal"
@@ -12,29 +13,29 @@ var (
 	ErrTimeout     = errors.New("cannot finish the tasks within timeout")
 )
 
+type Task func(ctx context.Context, id int) error
 type SimpleRunner struct {
-	Interrupt chan os.Signal
-	Timeout   <-chan time.Time // 用于计时
-	Complete  chan error       // 是否完成
-	Tasks     []func(int)
+	Timeout time.Duration // 用于计时
+	Tasks   []Task
 }
 
 func New(t time.Duration) *SimpleRunner {
 	return &SimpleRunner{
-		Interrupt: make(chan os.Signal, 1),
-		Timeout:   time.After(t),
-		Complete:  make(chan error),
-		Tasks:     make([]func(int), 0),
+		Timeout: t,
+		Tasks:   make([]Task, 0),
 	}
 }
-func (r *SimpleRunner) Run() error {
+func (r *SimpleRunner) Run(ctx context.Context) error {
 	for id, task := range r.Tasks {
-		select {
-		case <-r.Interrupt:
-			signal.Stop(r.Interrupt)
-			return ErrInterrupted
-		default:
-			task(id)
+
+		if err := ctx.Err(); err != nil {
+			return ConvertContextErr(err)
+		}
+		if err := task(ctx, id); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ConvertContextErr(ctxErr)
+			}
+			return err
 		}
 	}
 	return nil
@@ -42,18 +43,26 @@ func (r *SimpleRunner) Run() error {
 
 func (r *SimpleRunner) Start() error {
 	// relay interrupt from os
-	signal.Notify(r.Interrupt, os.Interrupt)
-	go func() {
-		r.Complete <- r.Run()
-	}()
-	select {
-	case err := <-r.Complete:
-		return err
-	case <-r.Timeout:
-		return ErrTimeout
-	}
+	ctx, stopSignal := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stopSignal()
+	ctx, cancelFunc := context.WithTimeout(ctx, r.Timeout)
+	defer cancelFunc()
+
+	return r.Run(ctx)
+
 }
 
-func (r *SimpleRunner) AddTasks(tasks ...func(int)) {
+func (r *SimpleRunner) AddTasks(tasks ...Task) {
 	r.Tasks = append(r.Tasks, tasks...)
+}
+
+func ConvertContextErr(err error) error {
+	switch err {
+	case context.DeadlineExceeded:
+		return ErrTimeout
+	case context.Canceled:
+		return ErrInterrupted
+	default:
+		return err
+	}
 }
